@@ -103,6 +103,8 @@ class CascadingMitigationEnv(gym.Env):
 
         self.allow_disconnect = bool(allow_disconnect)
         self.invalid_action_penalty = float(invalid_action_penalty)
+        self.reward_scale = 10.0
+        
 
         self.seed_value = seed
         self.rng = np.random.default_rng(seed)
@@ -320,21 +322,35 @@ class CascadingMitigationEnv(gym.Env):
     # Step
     # ------------------------------------------------------------------
     def step(self, action: int):
-        action = int(action)
-        previous_damage = self._compute_damage()
+        """
+        Apply one remedial action and propagate one cascade generation.
 
+        Reward design:
+            reward = damage_after_do_nothing - damage_after_action - action_cost_penalty
+
+        This is a counterfactual mitigation reward.
+        If the selected action reduces damage compared with do-nothing, reward is positive.
+        If the selected action is useless or harmful, reward is zero or negative.
+        """
+        action = int(action)
+
+        # 1. Compute counterfactual damage if the agent does nothing.
+        # This must be computed before applying the real action.
+        damage_do_nothing = self._simulate_do_nothing_damage_from_current_state()
+
+        # 2. Apply the real action.
         action_info = self._apply_action(action)
 
         if action_info["invalid"]:
             reward = -self.invalid_action_penalty
-            return (
-                self._get_obs(),
-                float(reward),
-                False,
-                False,
-                self._get_info(extra_info=action_info),
+            terminated = False
+            truncated = False
+
+            return self._get_obs(), reward, terminated, truncated, self._get_info(
+                extra_info=action_info
             )
 
+        # 3. Propagate cascade after the real action.
         degrees = self.current_adj.sum(axis=1)
 
         propagation_result = propagate_one_generation(
@@ -357,15 +373,20 @@ class CascadingMitigationEnv(gym.Env):
         self.failed_mask = propagation_result["failed_mask"]
         new_failed_nodes = propagation_result["new_failed_nodes"]
 
+        # 4. Update protection duration.
         self.protected_timer = np.maximum(self.protected_timer - 1, 0)
+
         self.current_step += 1
 
-        current_damage = self._compute_damage()
-        action_cost = float(action_info["cost"])
+        # 5. Compute actual damage after selected action.
+        damage_after_action = self._compute_damage()
+
+        # 6. Counterfactual reward.
+        action_cost = action_info["cost"]
+        benefit = damage_do_nothing - damage_after_action
 
         reward = (
-            previous_damage
-            - current_damage
+            self.reward_scale * benefit
             - self.reward_weights["action_cost"] * action_cost
         )
 
@@ -375,20 +396,17 @@ class CascadingMitigationEnv(gym.Env):
         extra_info = {
             **action_info,
             "new_failed_nodes": new_failed_nodes,
-            "previous_damage": previous_damage,
-            "current_damage": current_damage,
+            "damage_do_nothing": damage_do_nothing,
+            "damage_after_action": damage_after_action,
+            "benefit": benefit,
         }
 
-        self.prev_damage = current_damage
+        self.prev_damage = damage_after_action
 
-        return (
-            self._get_obs(),
-            float(reward),
-            terminated,
-            truncated,
-            self._get_info(extra_info=extra_info),
+        return self._get_obs(), float(reward), terminated, truncated, self._get_info(
+            extra_info=extra_info
         )
-
+    
     def _apply_action(self, action: int) -> dict[str, Any]:
         action_mask = self._build_action_mask()
 
@@ -593,7 +611,124 @@ class CascadingMitigationEnv(gym.Env):
         )
 
         return float(damage)
+    
+    def _copy_rng(self) -> np.random.Generator:
+        """
+        Copy the current numpy random generator.
 
+        This is used for counterfactual simulation so that the simulated do-nothing
+        branch does not change the real environment RNG state.
+        """
+        rng_copy = np.random.default_rng()
+        rng_copy.bit_generator.state = self.rng.bit_generator.state.copy()
+        return rng_copy
+
+
+    def _compute_metrics_from_state(
+        self,
+        adj_matrix: np.ndarray,
+        failed_mask: np.ndarray,
+    ) -> dict[str, float]:
+        """
+        Compute metrics from a hypothetical state.
+
+        This is used by counterfactual reward calculation.
+        """
+        failed_mask = np.asarray(failed_mask, dtype=bool)
+        adj_matrix = np.asarray(adj_matrix, dtype=float)
+
+        failed_fraction = float(np.mean(failed_mask))
+
+        active_nodes = np.where(~failed_mask)[0]
+
+        if len(active_nodes) == 0:
+            lcc_ratio = 0.0
+        else:
+            sub_adj = adj_matrix[np.ix_(active_nodes, active_nodes)]
+            graph = nx.from_numpy_array(sub_adj)
+
+            if graph.number_of_nodes() == 0:
+                lcc_ratio = 0.0
+            else:
+                components = list(nx.connected_components(graph))
+                largest_component = max((len(c) for c in components), default=0)
+                lcc_ratio = float(largest_component / self.N)
+
+        total_initial_load = max(float(np.sum(self.initial_load)), 1e-6)
+        failed_load = float(np.sum(self.initial_load[failed_mask]))
+        lost_load_ratio = failed_load / total_initial_load
+        served_load_ratio = 1.0 - lost_load_ratio
+
+        budget_used = self.initial_budget - self.budget_left
+
+        return {
+            "failed_fraction": failed_fraction,
+            "lcc_ratio": lcc_ratio,
+            "lost_load_ratio": lost_load_ratio,
+            "served_load_ratio": served_load_ratio,
+            "budget_left": float(self.budget_left),
+            "budget_used": float(budget_used),
+        }
+
+
+    def _compute_damage_from_state(
+        self,
+        adj_matrix: np.ndarray,
+        failed_mask: np.ndarray,
+    ) -> float:
+        """
+        Compute scalar damage from a hypothetical state.
+        """
+        metrics = self._compute_metrics_from_state(
+            adj_matrix=adj_matrix,
+            failed_mask=failed_mask,
+        )
+
+        damage = (
+            self.reward_weights["failed"] * metrics["failed_fraction"]
+            + self.reward_weights["lcc"] * (1.0 - metrics["lcc_ratio"])
+            + self.reward_weights["lost_load"] * metrics["lost_load_ratio"]
+        )
+
+        return float(damage)
+
+
+    def _simulate_do_nothing_damage_from_current_state(self) -> float:
+        """
+        Simulate one cascade generation under do-nothing action.
+
+        This does not modify the real environment.
+        It is used as the counterfactual baseline for reward calculation.
+        """
+        adj_copy = self.current_adj.copy()
+        load_copy = self.load.copy()
+        failed_copy = self.failed_mask.copy()
+        protected_timer_copy = self.protected_timer.copy()
+
+        rng_copy = self._copy_rng()
+        degrees = adj_copy.sum(axis=1)
+
+        result = propagate_one_generation(
+            adj_matrix=adj_copy,
+            load=load_copy,
+            capacity=self.capacity.copy(),
+            failed_mask=failed_copy,
+            protected_timer=protected_timer_copy,
+            protect_strength=self.protect_strength,
+            failure_model=self.failure_model,
+            redistribution_mode=self.redistribution_mode,
+            rng=rng_copy,
+            failure_gamma=self.failure_gamma,
+            failure_sharpness=self.failure_sharpness,
+            degrees=degrees,
+        )
+
+        damage = self._compute_damage_from_state(
+            adj_matrix=result["adj_matrix"],
+            failed_mask=result["failed_mask"],
+        )
+
+        return float(damage)
     def _check_terminated(self) -> bool:
         if self.current_step >= self.max_steps:
             return True
