@@ -362,7 +362,12 @@ def train(args: argparse.Namespace) -> None:
     plt.legend()
     plt.tight_layout()
     plt.ylim(bottom=0)
-    plt.savefig("outputs/figures/vector_dqn_training_return.png", dpi=300)
+    plt.savefig(
+        "outputs/figures/vector_dqn_training_return.png",
+        dpi=300,
+        bbox_inches="tight",
+        pad_inches=0.1,
+    )
     plt.close()
 
     # Plot failed fraction curve

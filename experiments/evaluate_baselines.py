@@ -369,7 +369,7 @@ def main(args: argparse.Namespace) -> None:
             policy_fn=policy_fn,
             args=args,
             episodes=args.episodes,
-            seed_offset=i * 100000,
+            seed_offset=0,
         )
 
         summary_rows.append(summary)
