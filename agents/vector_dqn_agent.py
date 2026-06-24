@@ -50,12 +50,14 @@ def flatten_obs(obs: dict[str, Any]) -> np.ndarray:
     node_features = np.asarray(obs["node_features"], dtype=np.float32).reshape(-1)
     adj_matrix = np.asarray(obs["adj_matrix"], dtype=np.float32).reshape(-1)
     global_features = np.asarray(obs["global_features"], dtype=np.float32).reshape(-1)
+    action_mask = np.asarray(obs["action_mask"], dtype=np.float32).reshape(-1)
 
     state = np.concatenate(
         [
             node_features,
             adj_matrix,
             global_features,
+            action_mask,
         ],
         axis=0,
     ).astype(np.float32)
